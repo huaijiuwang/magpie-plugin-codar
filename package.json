@@ -1,0 +1,49 @@
+{
+  "name": "magpie-plugin-codar",
+  "version": "0.1.2",
+  "description": "Codar (科搭) for magpie — its models as a provider, the daily check-in, and the account's points on the card",
+  "author": "MisonL",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MisonL/magpie-plugin-codar.git"
+  },
+  "homepage": "https://github.com/MisonL/magpie-plugin-codar",
+  "bugs": {
+    "url": "https://github.com/MisonL/magpie-plugin-codar/issues"
+  },
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "internal.mjs",
+    "catalog.mjs",
+    "scripts/catalog.mjs",
+    "test/plugin.test.mjs",
+    "test/style.test.mjs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode-plugin",
+    "codar",
+    "speedai",
+    "checkin"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.13"
+  },
+  "magpie": {
+    "icon": "https://codar.speedai.com/assets/codar-icon.png"
+  },
+  "scripts": {
+    "test": "node --test",
+    "catalog": "node scripts/catalog.mjs",
+    "catalog:check": "node scripts/catalog.mjs --check",
+    "prepublishOnly": "node --test"
+  }
+}
