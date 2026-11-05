@@ -89,6 +89,20 @@ magpie plugin login codar        # 见下方"登录"一节
 以后你发新 tag，那台机器改一次 spec 即可（pin 到 tag 的不会自动漂移）：
 `magpie plugin add github:huaijiuwang/magpie-plugin-codar#v0.2.2`。
 
+> **这台机器推代码要先过代理。** 直连 `github.com:443` 不通（`api.github.com` 反而通），
+> 而系统代理 `127.0.0.1:13024` 对大 pack 会截断（远端 index-pack 报
+> `did not receive expected object`）。可用的是 `127.0.0.1:7897`：
+>
+> ```bash
+> git -c http.proxy=http://127.0.0.1:7897 fetch mine --tags
+> ```
+>
+> 若 push 仍被截断，改用 `scripts/push-via-api.mjs`（GitHub Git Data API 逐文件建
+> 对象，绕开 pack 传输；已在 v0.2.2 上跑通）。注意它跳过
+> `.github/workflows/*`——经典 token 没勾 `workflow` 权限时 GitHub 对这类路径一律
+> 回 404，所以**远端没有 CI 配置**，本地留着不影响任何功能。要用 CI 就给 token
+> 补上 `workflow` 权限，再用 `--with-workflows` 跑一次。
+
 ### 方案 B：拷贝目录（离线 / 不想用 git）
 
 ```bash
