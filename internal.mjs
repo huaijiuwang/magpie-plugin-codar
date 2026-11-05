@@ -18,6 +18,8 @@ export const ID = "codar"
 // main.cjs 里 target "speedai" 走前者，其余 /v1/ 走后者。
 export const API = "https://api.claw.speedai.com"
 export const ACCOUNT = "https://api.kuaipaper.com"
+export const REFRESH_PATH = "/v1/token/refresh"
+export const LOGIN_PATH = "/v1/login"
 
 export const CATALOG_PATH = "/v1/codar/models"
 export const ACTIVITIES_PATH = "/api/codar/activities/mine"
@@ -169,17 +171,25 @@ export const CLAUDE = "@ai-sdk/anthropic"
 export const OPENAI = "@ai-sdk/openai-compatible"
 
 // tokenOf is the key this sign-in carries, or "" when there is none or it is
-// not one we can send. A key with anything but visible ASCII in it would put
-// the whole value into a fetch error message ("…is an invalid header value"),
-// which magpie logs and shows; it is refused here, before it can be echoed.
+// not one we can send. Two shapes carry it: an api sign-in's `key` (what
+// magpie saved from a pasted or read token), and an oauth session's `access`
+// — what magpie saves once the plugin hands back a refresh result (host.js's
+// save() picks the oauth branch when the result has `refresh`). Either reads
+// the same bearer string; a sign-in with both takes `access`, which is the
+// one a refresh renewed. A key with anything but visible ASCII in it would
+// put the whole value into a fetch error message ("…is an invalid header
+// value"), which magpie logs and shows; it is refused here, before it can be
+// echoed.
 export const tokenOf = (auth) => {
-  const token = auth?.type === "api" ? String(auth.key ?? "").trim() : ""
-  return token && /^[\x21-\x7e]+$/.test(token) ? token : ""
+  const token = auth?.type === "oauth" ? String(auth.access ?? "") : String(auth?.key ?? "")
+  const said = token.trim()
+  return said && /^[\x21-\x7e]+$/.test(said) ? said : ""
 }
 // unusableKey is a key that is there but cannot be sent: a missing one is a
 // different answer, and telling the user to "sign in again" for an empty one
-// sends them to the wrong place.
-export const unusableKey = (auth) => Boolean(String(auth?.key ?? "").trim()) && !tokenOf(auth)
+// sends them to the wrong place. Either field counts as "there".
+export const unusableKey = (auth) =>
+  (Boolean(String(auth?.key ?? "").trim()) || Boolean(String(auth?.access ?? "").trim())) && !tokenOf(auth)
 
 // payloadOf is a JWT's claims, or null when the string is not one. No
 // verification: the vendor is the one that checks the signature; we read it
@@ -222,7 +232,7 @@ export function expiresAt(token) {
   return Number.isFinite(n) && n > 0 ? n * 1000 : 0
 }
 
-// expired says whether the token has run out, as that same client decides
+// expired is whether the token has run out, as that same client decides
 // (app.asar's Zh: `i*1e3 - t <= 0 ? "expired"`): a stated exp in the past is
 // expired — the instant itself included, hence `>=` — while a token that
 // states no exp is not declared expired here (that client calls it "unknown",
@@ -233,6 +243,62 @@ export function expiresAt(token) {
 export const expired = (token) => {
   const n = expSeconds(token)
   return Number.isFinite(n) && Date.now() >= n * 1000
+}
+
+// RENEW_DAY_MS is the desktop app's own look beat: it asks for a renewal
+// once the session is a day old (app.asar's AUTH_TOKEN_RENEW_INTERVAL_MS =
+// 24h), and swallows the answer when the vendor refuses. The refusal is the
+// fact that matters (measured against the live endpoint): OUTSIDE the last
+// three days the vendor answers "Token is not close to expiration" — the
+// app's expiring_soon window (app.asar's AUTH_TOKEN_RENEW_WINDOW_MS = 3d)
+// is the server's own acceptance window. Inside it, a refresh succeeds and
+// the new token is seven days out again. So a daily beat would mostly ask
+// refusals; the record's renewal time instead points INTO the window.
+export const RENEW_DAY_MS = 24 * 60 * 60 * 1000
+export const RENEW_WINDOW_MS = 3 * RENEW_DAY_MS
+
+// cadence is when magpie should renew this token: a little inside the
+// vendor's three-day window (2.5 days of life left — the lead comes off the
+// top of that, so the first attempt sits comfortably inside; and a renewal
+// that fails is retried with a backoff that tops out at half an hour, with
+// half a day of slack behind it). A token already inside the window renews
+// on the next breath; one that states no exp keeps the app's daily beat,
+// where a refusal costs one request a day and says nothing about it.
+export const cadence = (token, now = Date.now()) => {
+  const real = expiresAt(token)
+  if (!real) return now + RENEW_DAY_MS
+  const at = real - RENEW_WINDOW_MS + RENEW_DAY_MS / 2
+  return at > now ? at : now + 60 * 1000
+}
+
+// sessionOf is the record this plugin hands magpie for a live token: the
+// shape host.js's save() writes through its oauth branch, so refresh()
+// renews it through magpie's own machinery (the 24h beat above, the per-
+// account renewal lock, keepAlive, and a 401 read as "renew, don't sign me
+// out"). Two fields are deliberate: `refresh` carries the bearer itself —
+// Codar re-news with the current token, there is no separate refresh token,
+// and an oauth record with no refresh would have staleAccess() treat a bare
+// 401 as the sign-in gone for good; and `accountId` is the vendor's own name
+// from the token's claims, which is what settle() dedupes accounts by —
+// without it every re-login opened a fresh codar#xxxxxx slot. `password`,
+// when the user chose to keep one, rides along so refresh() can re-login
+// after the vendor turns the session away; it is written to plugin-auth.json,
+// which magpie keeps 0600 and seals in a passphrase'd backup — README says
+// plain in words not to back it up with keys for anything shared.
+export const sessionOf = (token, { loginAt = 0, password = "", loginName = "", now = Date.now() } = {}) => {
+  const username = usernameOf(token)
+  return {
+    type: "success",
+    access: token,
+    refresh: token,
+    expires: cadence(token, now),
+    accountId: username,
+    username,
+    loginAt,
+    tokenExpiresAt: expiresAt(token),
+    ...(loginName && loginName !== username ? { loginName } : {}),
+    ...(password ? { password } : {}),
+  }
 }
 
 class ApiError extends Error {
@@ -357,7 +423,111 @@ export function appToken(file = configPath()) {
   // own claims; one without it would be saved and then fail on the card
   if (!usernameOf(token)) return { error: `${shown} 里的令牌没有账号名；打开一次科搭重新登录，或改用「科搭访问令牌」粘贴` }
   if (expired(token)) return { error: `${shown} 里的令牌已过期；打开一次科搭让它续期，再试一次` }
-  return { token }
+  let loginAt = 0
+  try {
+    loginAt = numOf(JSON.parse(text)?.provider?.speedai?.login_at) || 0
+  } catch {}
+  return { token, username: usernameOf(token), loginAt }
+}
+
+// renewToken trades a live token for a fresh one the way the desktop app
+// does (app.asar's refreshAuthSession): POST /v1/token/refresh, the bearer
+// being the current token, an empty body; the answer is {code, data:{token,
+// username}} and code 200 is the only success. It gives {token}, {error}, or
+// {gone: true} when the vendor turned the session away for good — 401/403 or
+// a business "expired/invalid token", the two ways this vendor says it.
+// Anything else (a timeout, a 5xx, a body we can't read) is {error} without
+// gone: a failed call says nothing about the sign-in, and magpie's renewal
+// backs off and asks again rather than marking the account.
+export async function renewToken(token, { timeoutMs = TIMEOUT_MS, fetchImpl = fetch } = {}) {
+  // "Token is not close to expiration" (measured) is the vendor saying NOT
+  // YET — the session is fine, it is only early. It says so with a 4xx and
+  // the word "expiration", which a naive auth-refusal match would read as
+  // the sign-in dying and mark a healthy account expired. So the too-early
+  // answer is named first and kept out of the gone class; the HTTP status is
+  // the backstop — 401/403 carry no "not close" wording.
+  const tooEarly = (text) => /not close to|尚未.*过期|未接近|临期才|接近过期/i.test(text)
+  const gone = (text) => !tooEarly(text) && /过期|失效|无效|invalid|expired/i.test(text)
+  try {
+    const body = await request(`${ACCOUNT}${REFRESH_PATH}`, { method: "POST", token, timeoutMs, fetchImpl })
+    const code = numOf(body?.code)
+    if (Number.isFinite(code) && code !== 200) {
+      const words = saidBy(body) || ""
+      if (tooEarly(words)) return { early: true, error: words }
+      return gone(words) ? { gone: true, error: words || "登录已过期" } : { error: words || "续期失败" }
+    }
+    const fresh = String(unwrapped(body)?.token ?? "")
+    if (!fresh) return { error: "续期响应里没有令牌" }
+    if (usernameOf(fresh) && usernameOf(fresh) !== usernameOf(token)) return { gone: true, error: "续期返回了另一个账号" }
+    if (expired(fresh)) return { error: "续期拿到的令牌已过期" }
+    return { token: fresh }
+  } catch (e) {
+    if (signedOut(e)) {
+      const words = whyOf(e) || ""
+      return tooEarly(words) ? { early: true, error: words } : { gone: true, error: words || "登录已过期" }
+    }
+    return { error: whyOf(e) || "续期请求失败" }
+  }
+}
+
+// loginWithPassword signs in over the account domain's own /v1/login — the
+// same call the desktop app's loginWithPassword and speedai.com's web page
+// make, {username, password} in, {code:200, data:{token, username}} out. It
+// is the plugin's second leg of renewal: when the vendor turns a refresh
+// away and the user chose to keep a password, a fresh session comes from the
+// stable public endpoint instead of a manual re-login. Only an auth-grade
+// refusal (401/403, or the vendor's own wrong-password wording) is gone: a
+// wrong password is the sign-in ending, and no retry will fix it. A 201
+// ip_verify_required is a wall this plugin will not climb — no captcha, no
+// SMS — and says so. Every other failure (timeout, 5xx) is a plain error
+// magpie backs off from; one broken network must not mark every account
+// signed out. The password is never echoed: the message is built from the
+// vendor's words with the password cut out of them.
+export async function loginWithPassword(username, password, { timeoutMs = TIMEOUT_MS, fetchImpl = fetch } = {}) {
+  const gone = (text) => /密码|账号或|不正确|invalid|incorrect|locked/i.test(text)
+  let res
+  try {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), timeoutMs)
+    res = await fetchImpl(`${ACCOUNT}${LOGIN_PATH}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": UA_DESKTOP },
+      body: JSON.stringify({ username, password }),
+      signal: ctl.signal,
+    }).finally(() => clearTimeout(timer))
+  } catch (e) {
+    return { error: e?.name === "AbortError" ? "登录请求超时" : whyOf(e) || "登录请求失败" }
+  }
+  const { text } = await readAnswer(res)
+  let body = null
+  try {
+    body = text ? JSON.parse(text.replace(/^\uFEFF/, "")) : null
+  } catch {}
+  const said = (saidBy(body) || `HTTP ${res.status}`).split(password).join("…")
+  if (!res.ok) return signedOut(res) ? { gone: true, error: said } : { error: said }
+  const code = numOf(body?.code)
+  const status = String(body?.status ?? "").toLowerCase()
+  if (code === 201 || status === "ip_verify_required")
+    return { error: "这个网络第一次登录该账号需要短信验证，请在科搭网页或桌面端完成一次登录后再试" }
+  if (Number.isFinite(code) && code !== 200) return gone(said) ? { gone: true, error: said } : { error: said }
+  const data = unwrapped(body)
+  const token = String(data?.token ?? "")
+  if (!token) return { error: "登录响应里没有令牌" }
+  if (!tokenOf({ type: "api", key: token })) return { error: "登录拿到的令牌无法识别" }
+  // The name typed in and the name in the token are NOT the same string and
+  // must not be compared: people sign in with a phone number or an email,
+  // while the vendor's own name for the account is `user_<phone>_<n>`
+  // (measured: `13800000000` → `user_13800000000_0001`). An equality check
+  // here refuses every real password sign-in with "登录返回了另一个账号".
+  // The login answer is by definition the account that was just signed in
+  // to; only the RENEWAL path needs a cross-check (one token must not renew
+  // into another account). What is kept is the login name itself, so the
+  // password leg can sign in again later — `user_<phone>_<n>` is not
+  // guaranteed to be accepted by /v1/login, the phone/email it came from is.
+  const account = usernameOf(token)
+  if (!account) return { error: "登录拿到的令牌里没有账号名" }
+  if (expired(token)) return { error: "登录拿到的令牌已过期" }
+  return { token, username: account, loginName: username }
 }
 
 // saidBy is what an answer says in words, read the way the vendor's own client
@@ -903,4 +1073,4 @@ export const scrubLine = (said, key) => {
 export const scrub = (said, token) => cut(scrubLine(said, String(token ?? "")), 400)
 export const signMessage = (r, token) => scrub(saidBy(r), token)
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, agentPointsOf, pickOf, balanceOf, unwrapped, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, request, readAnswer, appToken, configPath, shownPath, cleanText, magicKeys: MAGIC_KEYS, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, cadence, sessionOf, modelOf, catalogOf, protocolOf, mergeModel, agentPointsOf, pickOf, balanceOf, unwrapped, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, request, readAnswer, appToken, configPath, shownPath, cleanText, renewToken, loginWithPassword, magicKeys: MAGIC_KEYS, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }

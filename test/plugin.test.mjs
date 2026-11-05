@@ -12,7 +12,7 @@ import { testables } from "../internal.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, expired, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, MAX_MODELS, MAX_ANSWER_BYTES } = testables
+const { tokenOf, usernameOf, expiresAt, expired, cadence, renewToken, loginWithPassword, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, MAX_MODELS, MAX_ANSWER_BYTES } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -1322,16 +1322,20 @@ test("a request that has already answered is not aborted later", async () => {
   }
 })
 
-test("the read-from-this-machine sign-in hands magpie a key, and says why when it can't", async () => {
+test("the read-from-this-machine sign-in hands magpie a session, and says why when it can't", async () => {
   const p = await CodarPlugin()
-  const [read, paste] = p.auth.methods
+  const [read, password, paste] = p.auth.methods
   assert.equal(read.keyless, true, "magpie skips the key prompt for a keyless method")
   assert.equal(typeof read.authorize, "function")
-  assert.equal(paste.keyless, undefined, "pasting stays a plain key method")
+  assert.equal(password.keyless, true, "the password method drives its own prompts")
+  assert.deepEqual(password.prompts.map((q) => q.key), ["username", "password"], "two questions, in order")
+  assert.equal(paste.keyless, true, "pasting drives its own prompt too")
+  assert.deepEqual(paste.prompts.map((q) => q.key), ["token"], "one question: the token itself")
+  assert.equal(paste.type, "api", "and an api one, as the others")
   assert.deepEqual(
     p.auth.methods.map((m) => m.label),
-    ["读取本机科搭令牌", "科搭访问令牌"],
-    "both buttons lead with the vendor's name and say which token each one takes",
+    ["读取本机科搭令牌", "科搭账号密码", "科搭访问令牌"],
+    "three buttons, each saying which credential it takes",
   )
 
   // a file the app would leave: nested provider → speedai → token
@@ -1379,9 +1383,19 @@ test("the read-from-this-machine sign-in hands magpie a key, and says why when i
       assert.equal(lapsed.type, "failed", "the lapsed token is refused, not handed to magpie")
       assert.match(lapsed.error, /已过期/)
 
+      // a session, not a bare key: magpie's save() takes the oauth branch
+      // when the result carries `refresh`, and the renewal machinery reads
+      // expires off the stored record — both only hold for this shape.
       writeFileSync(file, JSON.stringify({ provider: { speedai: { token } } }))
-      assert.deepEqual(await read.authorize(), { type: "success", key: token }, "the app's own token, handed over")
-      assert.deepEqual(await read.authorize({ file: join(dir, "other.json") }), { type: "success", key: token }, "an argument names no other file: the path is the app's own")
+      const s = await read.authorize()
+      assert.equal(s.type, "success")
+      assert.equal(s.access, token, "the app's own token, as the bearer it carries")
+      assert.equal(s.refresh, token, "the same token re-news itself; an oauth record with no refresh would turn a 401 into a sign-out")
+      assert.equal(s.accountId, "user_1", "the vendor's name, which settle() dedupes accounts by")
+      assert.ok(s.expires > Date.now() && s.expires <= Date.now() + 86400e3 + 60000, "a renewal cadence, not the real 7-day exp")
+      assert.equal(s.tokenExpiresAt, expiresAt(token), "the real exp rides along for the card")
+      const viaArg = await read.authorize({ file: join(dir, "other.json") })
+      assert.equal(viaArg.access, token, "an argument names no other file: the path is the app's own")
     } finally {
       if (had === undefined) delete process.env.CODAR_HOME
       else process.env.CODAR_HOME = had
@@ -1389,6 +1403,244 @@ test("the read-from-this-machine sign-in hands magpie a key, and says why when i
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ---- renewal: the two legs, and what each answer means -------------------
+
+test("cadence aims into the vendor's three-day renewal window", () => {
+  const day = 86400e3
+  const now = Date.now()
+  // the live server answers "Token is not close to expiration" outside the
+  // last three days (measured 2026-11-05); app.asar's own expiring_soon
+  // window is the same three days. A 7-day token is therefore asked on day
+  // 4.5 — half a day inside the window — not a day out, and not at the exp.
+  const fresh = mkToken({ username: "u", exp: Math.floor(now / 1000) + 7 * 86400 })
+  assert.equal(cadence(fresh, now), expiresAt(fresh) - 3 * day + day / 2, "half a day inside the window")
+  assert.ok(cadence(fresh, now) - now > 3 * day && cadence(fresh, now) - now < 5 * day, "day 4.5 of a 7-day session")
+  // one already inside the window is due now: the next breath, not a beat
+  const inside = mkToken({ username: "u", exp: Math.floor(now / 1000) + 2 * 86400 })
+  assert.equal(cadence(inside, now), now + 60 * 1000, "due the moment it is saved")
+  // a token that says nothing keeps the app's daily look: a refusal costs
+  // one request a day and says nothing about the sign-in
+  const silent = mkToken({ username: "u" })
+  assert.equal(cadence(silent, now) - now, day, "the daily beat, the vendor's answer decides")
+})
+
+test("a too-early refusal is the vendor's \"not yet\", not a dead session", async () => {
+  // the exact live answer measured today: an HTTP 4xx carrying the word
+  // "expiration". Matched only by the wording — an auth-class match would
+  // take it for gone and mark a healthy account expired.
+  const { renewToken } = testables
+  const token = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 7 * 86400 })
+  const out = await withFetch(
+    { "POST /v1/token/refresh": { status: 401, body: { detail: "Token is not close to expiration" } } },
+    () => renewToken(token),
+  )
+  assert.equal(out.early, true, "the too-early answer is named")
+  assert.equal(out.gone, undefined, "and kept out of the gone class")
+  const body = await withFetch(
+    { "POST /v1/token/refresh": { body: { code: 400, message: "Token is not close to expiration" } } },
+    () => renewToken(token),
+  )
+  assert.equal(body.early, true, "the same refusal spelled in the body")
+})
+
+
+test("refresh trades the token at the account domain and re-times the record", async () => {
+  const p = await CodarPlugin()
+  const fresh = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 7 * 86400 })
+  const stored = { type: "oauth", access: TOKEN, refresh: TOKEN, expires: Date.now() - 1, accountId: "user_1" }
+  const [out, calls] = await withFetch(
+    { "POST /v1/token/refresh": { code: 200, message: "success", data: { token: fresh, username: "user_1" } } },
+    async (calls) => [await p.auth.refresh(stored), calls],
+  )
+  assert.equal(out.access, fresh, "the new bearer")
+  assert.equal(out.refresh, fresh, "and it is its own renewer again")
+  assert.equal(out.accountId, "user_1", "the identity stands")
+  assert.ok(out.expires > Date.now() + 3 * 86400e3 && out.expires < Date.now() + 5 * 86400e3, "a renewal lands inside the vendor's window")
+  assert.equal(out.tokenExpiresAt, expiresAt(fresh), "the real exp rides along")
+  assert.equal(calls[0].init.headers.Authorization, `Bearer ${TOKEN}`, "the current token is the credential")
+})
+
+test("a vendor 401 without a kept password marks the account, a network error does not", async () => {
+  const p = await CodarPlugin()
+  const stored = { type: "oauth", access: TOKEN, refresh: TOKEN, expires: Date.now() - 1, accountId: "user_1" }
+
+  const marked = await withFetch({ "POST /v1/token/refresh": { status: 401, body: { detail: "token has expired" } } }, () => p.auth.refresh(stored).then(() => null, (e) => e))
+  assert.ok(marked instanceof Error)
+  assert.equal(marked.signIn, "expired", "the vendor turned the session away for good")
+
+  const business = await withFetch({ "POST /v1/token/refresh": { body: { code: 401, message: "登录已过期" } } }, () => p.auth.refresh(stored).then(() => null, (e) => e))
+  assert.equal(business.signIn, "expired", "the same refusal spelled in the body")
+
+  const backed = await withFetch({ "POST /v1/token/refresh": () => Promise.reject(new TypeError("fetch failed")) }, () => p.auth.refresh(stored).then(() => null, (e) => e))
+  assert.ok(backed instanceof Error)
+  assert.equal(backed.signIn, undefined, "one broken network says nothing about the sign-in: magpie backs off and asks again")
+})
+
+test("a session the vendor dropped is signed in again with the kept password", async () => {
+  const p = await CodarPlugin()
+  const fresh = mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) + 7 * 86400 })
+  const stored = { type: "oauth", access: TOKEN, refresh: TOKEN, expires: Date.now() - 1, accountId: "user_1", password: "sesame" }
+  const [out, calls] = await withFetch(
+    {
+      "POST /v1/token/refresh": { status: 401, body: { detail: "token has expired" } },
+      "POST /v1/login": { code: 200, data: { username: "user_1", token: fresh } },
+    },
+    async (calls) => [await p.auth.refresh(stored), calls],
+  )
+  assert.equal(out.access, fresh, "the re-login's token replaces the dead session")
+  assert.equal(out.password, "sesame", "and the kept password rides along for the next time")
+  assert.deepEqual(JSON.parse(calls[1].init.body), { username: "user_1", password: "sesame" }, "no login name kept: the token's own name is what /v1/login is given")
+
+  // with a login name kept (a phone number), that is what is signed in with —
+  // `user_13800000000_0001` is the vendor's internal name, not a /v1/login
+  // credential, and feeding it back there is how the second leg dies.
+  const byPhone = await withFetch(
+    {
+      "POST /v1/token/refresh": { status: 401, body: { detail: "token has expired" } },
+      "POST /v1/login": { code: 200, data: { username: "user_1", token: fresh } },
+    },
+    async (calls) => [await p.auth.refresh({ ...stored, loginName: "13800000000" }), calls],
+  )
+  assert.equal(byPhone[0].loginName, "13800000000", "the typed name is kept on the renewed record")
+  assert.deepEqual(JSON.parse(byPhone[1][1].init.body), { username: "13800000000", password: "sesame" }, "the phone number is given back to /v1/login")
+})
+
+test("a re-login answering another account does not overwrite the slot", async () => {
+  const p = await CodarPlugin()
+  const other = mkToken({ username: "user_other", exp: Math.floor(Date.now() / 1000) + 7 * 86400 })
+  const stored = { type: "oauth", access: TOKEN, refresh: TOKEN, expires: Date.now() - 1, accountId: "user_1", password: "sesame", loginName: "13800000000" }
+  const e = await withFetch(
+    {
+      "POST /v1/token/refresh": { status: 401, body: { detail: "token has expired" } },
+      "POST /v1/login": { code: 200, data: { username: "user_other", token: other } },
+    },
+    () => p.auth.refresh(stored).then(() => null, (x) => x),
+  )
+  assert.ok(e instanceof Error)
+  assert.match(e.message, /另一个账号/, "a renewal must never turn one slot into another account")
+  assert.equal(e.signIn, undefined, "and it is a stopped renewal, not a sign-out")
+})
+
+test("a re-login that needs SMS verification is said in words, not marked expired", async () => {
+  const p = await CodarPlugin()
+  const stored = { type: "oauth", access: TOKEN, refresh: TOKEN, expires: Date.now() - 1, accountId: "user_1", password: "sesame" }
+  const e = await withFetch(
+    {
+      "POST /v1/token/refresh": { status: 401, body: { detail: "token has expired" } },
+      "POST /v1/login": { body: { code: 201, status: "ip_verify_required", username: "user_1", token: "temp" } },
+    },
+    () => p.auth.refresh(stored).then(() => null, (x) => x),
+  )
+  assert.ok(e instanceof Error)
+  assert.match(e.message, /短信验证/, "the user hears what to do: sign in once from a known network")
+  assert.equal(e.signIn, undefined, "the account is not dropped for it — it is still valid, the network is the new thing")
+})
+
+test("a wrong password ends the sign-in; a silent one keeps it alive", async () => {
+  const p = await CodarPlugin()
+  const stored = { type: "oauth", access: TOKEN, refresh: TOKEN, expires: Date.now() - 1, accountId: "user_1", password: "wrong" }
+  const wrong = await withFetch(
+    {
+      "POST /v1/token/refresh": { status: 401, body: {} },
+      "POST /v1/login": { code: 401, message: "账号或密码不正确" },
+    },
+    () => p.auth.refresh(stored).then(() => null, (e) => e),
+  )
+  assert.equal(wrong.signIn, "expired", "no retry fixes a wrong password")
+  assert.equal(String(wrong.message).includes("wrong"), false, "and the password is not echoed")
+
+  const timeout = await withFetch(
+    {
+      "POST /v1/token/refresh": { status: 401, body: {} },
+      "POST /v1/login": () => Promise.reject(new TypeError("fetch failed")),
+    },
+    () => p.auth.refresh(stored).then(() => null, (e) => e),
+  )
+  assert.equal(timeout.signIn, undefined, "a login the network never carried says nothing about the password")
+})
+
+test("the password method signs a session magpie can renew", async () => {
+  const p = await CodarPlugin()
+  const [, password] = p.auth.methods
+  const fresh = mkToken({ username: "user_9", exp: Math.floor(Date.now() / 1000) + 7 * 86400 })
+  const [out, calls] = await withFetch(
+    { "POST /v1/login": { code: 200, data: { username: "user_9", token: fresh } } },
+    async (calls) => [await password.authorize({ username: "user_9", password: "sesame" }), calls],
+  )
+  assert.equal(out.access, fresh)
+  assert.equal(out.accountId, "user_9", "the identity settle() dedupes by")
+  assert.equal(out.password, "sesame", "kept so the renewal can re-login on its own")
+  assert.equal(calls.length, 1)
+  assert.deepEqual(JSON.parse(calls[0].init.body), { username: "user_9", password: "sesame" }, "the typed name goes to the vendor exactly as typed")
+  const none = await password.authorize({ username: "user_9", password: "" })
+  assert.equal(none.type, "failed", "both answers are required before anything is asked of the vendor")
+})
+
+test("a phone number signed in with a password is the same account as its user_… token", async () => {
+  // Measured on the live vendor (2026-11-05): signing in with the phone
+  // number 13800000000 answers a token whose own name is
+  // `user_13800000000_0001`. The two are one account and must never be
+  // compared as strings — an equality check there refuses every real
+  // password sign-in with "登录返回了另一个账号".
+  const p = await CodarPlugin()
+  const [, password] = p.auth.methods
+  const token = mkToken({ username: "user_13800000000_0001", exp: Math.floor(Date.now() / 1000) + 7 * 86400 })
+  const [out, calls] = await withFetch(
+    { "POST /v1/login": { code: 200, data: { username: "user_13800000000_0001", token } } },
+    async (calls) => [await password.authorize({ username: "13800000000", password: "sesame" }), calls],
+  )
+  assert.equal(out.type, "success", "a phone number is a name /v1/login accepts")
+  assert.equal(out.accountId, "user_13800000000_0001", "the identity is the token's own claim")
+  assert.equal(out.loginName, "13800000000", "the typed name is kept: user_… is not what /v1/login takes back")
+  assert.equal(out.password, "sesame")
+  assert.deepEqual(JSON.parse(calls[0].init.body), { username: "13800000000", password: "sesame" })
+  const phone = await withFetch(
+    { "POST /v1/login": { code: 200, data: { username: "user_9", token: mkToken({ username: "user_9", exp: Math.floor(Date.now() / 1000) + 86400 }) } } },
+    () => password.authorize({ username: "user_9@example.com", password: "sesame" }),
+  )
+  assert.equal(phone.loginName, "user_9@example.com", "an email is kept the same way")
+  assert.equal(phone.accountId, "user_9")
+})
+
+test("the paste method saves a session, not a bare key, and refuses the hopeless", async () => {
+  const p = await CodarPlugin()
+  const [, , paste] = p.auth.methods
+  const s = await paste.authorize({ token: TOKEN })
+  assert.equal(s.access, TOKEN)
+  assert.equal(s.accountId, "user_1", "a pasted token still brings the identity: it is the same JWT")
+  const lapsed = await paste.authorize({ token: mkToken({ username: "user_1", exp: Math.floor(Date.now() / 1000) - 60 }) })
+  assert.equal(lapsed.type, "failed", "an expired paste would only fail again on the card")
+  assert.match(lapsed.error, /已过期/)
+  const blank = await paste.authorize({ token: "  " })
+  assert.equal(blank.type, "failed")
+})
+
+test("a renewed session keeps sending every call the way the old one did", async () => {
+  // the loader, checkin, usage and models all read tokenOf(auth); an oauth
+  // record answers from access. One of them left reading `key` alone would
+  // sign its requests with an empty bearer once magpie renews the account.
+  const p = await CodarPlugin()
+  const oauth = async () => ({ type: "oauth", access: TOKEN, refresh: TOKEN, expires: Date.now() + 3600e3, accountId: "user_1" })
+  const r = await withFetch(
+    {
+      "/v1/gettoken": { code: 200, token: 5, agent_token: 0 },
+      "POST /v1/daily-sign": { code: 200, message: "签到成功" },
+    },
+    () => p.auth.checkin(oauth),
+  )
+  assert.equal(r.outcome, "claimed", "the check-in carries the bearer from access")
+  const u = await withFetch(
+    {
+      "/v1/gettoken": { code: 200, token: 5, agent_token: 1 },
+      "/v1/agent/balance": { code: 200, data: { balance: 1 } },
+      "/v1/daily-sign/status": { code: 200, data: { signed: false } },
+      "/api/codar/activities/mine": { code: 200, data: [] },
+    },
+    () => p.auth.usage(oauth),
+  )
+  assert.ok(!u.error || !/没有登录信息/.test(u.error), "usage reads the same session")
 })
 
 test("the token never leaves in a message", async () => {
@@ -1499,7 +1751,7 @@ test("the read-from-this-machine sign-in follows CODAR_HOME, as the app does", (
   const had = process.env.CODAR_HOME
   process.env.CODAR_HOME = dir
   try {
-    assert.deepEqual(appToken(), { token }, "the default path follows CODAR_HOME")
+    assert.deepEqual(appToken(), { token, username: "user_1", loginAt: 0 }, "the default path follows CODAR_HOME")
   } finally {
     if (had === undefined) delete process.env.CODAR_HOME
     else process.env.CODAR_HOME = had

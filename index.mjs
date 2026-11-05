@@ -24,7 +24,7 @@
 
 
 import { CATALOG } from "./catalog.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, catalogOf, checkinWaitSecs, cleanText, configPath, cut, expired, expiresAt, gain, humanSecs, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, plain, pointsOf, protocolOf, publishedConcurrency, readAnswer, request, runningActivities, safeTime, saidBy, scrub, scrubLine, secsOf, shownPath, signMessage, signedIn, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, REFRESH_PATH, RENEW_DAY_MS, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, cadence, catalogOf, checkinWaitSecs, cleanText, configPath, cut, expired, expiresAt, gain, humanSecs, loginWithPassword, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, plain, pointsOf, protocolOf, publishedConcurrency, readAnswer, renewToken, request, runningActivities, safeTime, saidBy, scrub, scrubLine, secsOf, sessionOf, shownPath, signMessage, signedIn, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./internal.mjs"
 
 export async function CodarPlugin(input) {
   // 每次调用现取，而不是建插件时抓一个：测试会在这之后换掉全局那个。宿主
@@ -53,10 +53,13 @@ export async function CodarPlugin(input) {
         return vendorConcurrency || 3
       },
 
-      // 两种登录：粘贴令牌，或让插件在这台机器上读科搭自己的登录信息。
-      // 后者是 keyless + authorize（magpie 的契约，host.js 的 apiKey()）：
-      // 不弹输入框，由插件把令牌交上去，存进 magpie 的 plugin-auth.json。
-      // 令牌过期后重新登录一次即可，不用手工复制。
+      // 三种登录：读本机令牌、账号密码、粘贴令牌。前两种都交给 magpie 一
+      // 份 oauth 会话（host.js 的 save()：结果里有 refresh 就走 oauth 分支），
+      // 于是每个账号的记录带着 accountId（厂商的账号名，settle() 按它去重，
+      // 重新登录覆盖同槽而不是再开一个 codar#xxxxxx）、带着可续期的形态
+      // （宿主的 keepAlive/renewAt 只认 oauth+expires），续期归下面 refresh。
+      // 粘贴法仍是 api 记录（宿主拿到 key 直接存），accountId 拿不到——它
+      // 保持原样，作为兜底通道。
       methods: [
         {
           type: "api",
@@ -71,15 +74,101 @@ export async function CodarPlugin(input) {
           async authorize() {
             const got = appToken()
             if (got.error) return { type: "failed", error: got.error }
-            return { type: "success", key: got.token }
+            return sessionOf(got.token, { loginAt: got.loginAt })
           },
         },
         {
           type: "api",
+          keyless: true,
+          label: "科搭账号密码",
+          prompts: [
+            { key: "username", type: "text", message: "科搭账号（手机号 / 邮箱 / user_… 用户名）" },
+            { key: "password", type: "password", message: "科搭密码", placeholder: "只在登录与续期时发给 api.kuaipaper.com" },
+          ],
+          // 密码登录走的是厂商稳定的公开接口（桌面端与网页端同一个），成功
+          // 交 oauth 会话；密码与"登录名"一起留在记录里——登录名是用户输的
+          // 手机号/邮箱，和令牌里的 user_… 不是一回事，续期被吊销时用它重登。
+          async authorize(inputs) {
+            const loginName = String(inputs?.username ?? "").trim()
+            const password = String(inputs?.password ?? "")
+            if (!loginName || !password) return { type: "failed", error: "账号和密码都要填" }
+            const got = await loginWithPassword(loginName, password, { fetchImpl })
+            if (got.error && !got.token) return { type: "failed", error: got.error }
+            return sessionOf(got.token, { password, loginName })
+          },
+        },
+        {
+          type: "api",
+          keyless: true,
           label: "科搭访问令牌",
-          placeholder: "eyJ…（~/.codar/config.json 的 provider.speedai.token）",
+          prompts: [{ key: "token", type: "text", message: "粘贴科搭令牌（~/.codar/config.json 的 provider.speedai.token）", placeholder: "eyJ…" }],
+          // 粘贴也交会话，而不是裸 key：这样三条路落进 plugin-auth.json 的
+          // 都是带 accountId 的 oauth 记录，settle() 都按账号去重，宿主的
+          // 续期通道也都认。校验不过就报原因，别把一个救不回来的记录存下去。
+          async authorize(inputs) {
+            const token = String(inputs?.token ?? "").trim()
+            if (!token) return { type: "failed", error: "没有粘贴令牌" }
+            if (!tokenOf({ type: "api", key: token })) return { type: "failed", error: "令牌内容无法识别（含空格、换行或非 ASCII 字符），请粘贴科搭登录后的完整令牌" }
+            if (!usernameOf(token)) return { type: "failed", error: "令牌里没有账号名，请粘贴科搭登录后的完整令牌" }
+            if (expired(token)) return { type: "failed", error: "这把令牌已过期；打开一次科搭让它续期，或改用账号密码登录" }
+            return sessionOf(token)
+          },
         },
       ],
+
+      // magpie 的续期钩子（host.js 的 renew）：oauth 记录到点（expires -
+      // refreshLead，下面声明 30 分钟）被请求、用量、签到或后台 keepAlive
+      // 调到。返回要合并的字段，magpie 存回该账号的槽。
+      //   1) /v1/token/refresh —— 桌面端自己的续期路，带当前令牌，日常都该
+      //      走这条；成功重新计时（expires 用 cadence：瞄准厂商"到期前 3 天"
+      //      的接受窗口内侧，见 internal.mjs 里实测到的那个拒绝）。
+      //   2) 厂商明确吊销（gone）且记录里有托管密码 → /v1/login 重新登录，
+      //      仍是同账号才算数。没有密码、或重登也被拒（要短信验证等），抛
+      //      signIn:"expired"：magpie 把账号标成失效但保留槽位，卡片会喊人。
+      //   3) 网络错、超时、5xx、"还没到窗口" → 抛普通错误。magpie 退避重试，
+      //      账号不标记：一次断网不该把整批账号判死。
+      async refresh(stored) {
+        const token = tokenOf(stored)
+        if (!token) throw Object.assign(new Error("没有可用的登录信息，请重新登录"), { signIn: "expired" })
+        const mine = usernameOf(token) || String(stored?.accountId ?? "")
+        // 重登用记录里的登录名（手机号/邮箱），没有才退回令牌里的 user_…：
+        // /v1/login 认的是人输的那个名字，令牌里的是厂商内部名。
+        const who = String(stored?.loginName ?? "") || mine
+        const got = await renewToken(token, { fetchImpl })
+        if (got.token)
+          return sessionOf(got.token, {
+            loginAt: Date.now(),
+            ...(stored?.password ? { password: stored.password, loginName: who } : {}),
+          })
+        // 厂商说"还没到续期窗口"：会话好得很，只是问早了。抛普通错误（不标
+        // 记账号），宿主 30 分钟退避后再问；cadence 已把首问放在窗口内，这里
+        // 只是窗口边界或厂商改主意时的兜底。
+        if (got.early) throw new Error(got.error || "未到续期窗口")
+        if (got.gone && stored?.password && who) {
+          const back = await loginWithPassword(who, stored.password, { fetchImpl })
+          if (back.token) {
+            // 同一个槽只能装同一个账号：重登返回的令牌若指向别的账号，宁可
+            // 报错也不覆盖——这是续期路径上唯一需要防的串号。
+            if (mine && back.username && back.username !== mine)
+              throw new Error("重新登录返回了另一个账号，已停止")
+            return sessionOf(back.token, {
+              loginAt: Date.now(),
+              password: stored.password,
+              loginName: who,
+            })
+          }
+          if (!back.gone) throw new Error(back.error)
+          throw Object.assign(new Error(back.error || "登录已过期，请重新登录"), { signIn: "expired" })
+        }
+        if (got.gone) throw Object.assign(new Error(got.error || "登录已过期，请重新登录"), { signIn: "expired" })
+        throw new Error(got.error || "续期失败")
+      },
+
+      // 提前半小时开始续（cadence 已把到点时间放进厂商的 3 天窗口内，这里
+      // 的 lead 只是让窗口边界上的账号提前一次问到，失败还有退避兜着）。
+      // keepAlive 不写即默认开：没人用的账号也会被后台按时续住——这正是
+      // 多账号"挂着不掉线"需要的。
+      refreshLead: 30 * 60 * 1000,
 
       // What a request for this account carries: the stored key. magpie falls
       // back to it without a loader, but the contract for a provider served
@@ -102,7 +191,7 @@ export async function CodarPlugin(input) {
           auth = await getAuth()
           token = tokenOf(auth)
         } catch (e) {
-          return { outcome: "failed", message: scrub(whyOf(e), auth?.key) || "签到失败" }
+          return { outcome: "failed", message: scrub(whyOf(e), tokenOf(auth)) || "签到失败" }
         }
         if (!token)
           return {
