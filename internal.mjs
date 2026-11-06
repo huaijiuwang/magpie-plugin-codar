@@ -641,7 +641,11 @@ export async function request(url, { method = "GET", body, token, timeoutMs = TI
       method,
       headers: {
         Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+        // Content-Type only when there is a body to describe. The desktop's
+        // own fetch sends it on POSTs and not on the catalog GET; adding it
+        // to a GET is a header the App never sends, and the goal here is to
+        // look like the App (measured 2026-11-06).
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         "User-Agent": ua,
       },
       body: body === undefined ? undefined : JSON.stringify(body),

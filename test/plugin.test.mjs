@@ -2023,8 +2023,13 @@ test("each endpoint is asked with its own method, host, body and credential", as
   assert.equal(cat.host, "api.claw.speedai.com")
   assert.equal(cat.body, undefined)
 
+  // Content-Type describes a body, so it rides only where there is one: the
+  // desktop's own fetch sends it on POSTs and not on the catalog GET, and a
+  // header the App never sends is exactly what this plugin must not add
+  // (measured 2026-11-06).
   for (const s of seen) {
-    assert.equal(s.type, "application/json", "every request says it is JSON")
+    if (s.body === undefined) assert.equal(s.type, undefined, `${s.method} ${s.path} carries no body, so says no type`)
+    else assert.equal(s.type, "application/json", `${s.method} ${s.path} has a body, so says it is JSON`)
     assert.equal(s.ua, "node", "and goes out as the desktop's own fetch does")
   }
 })
