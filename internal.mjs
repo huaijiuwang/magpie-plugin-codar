@@ -302,13 +302,27 @@ export const sessionOf = (token, { loginAt = 0, password = "", loginName = "", n
 }
 
 class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, code = "") {
     super(message)
     this.status = status
+    // the vendor's own business code, when it named one: "account_restricted"
+    // is the one that matters here, because it is a 403 that is NOT a lapsed
+    // sign-in (see restricted).
+    this.code = code
   }
 }
 
 export const signedOut = (e) => e?.status === 401 || e?.status === 403
+
+// restricted is the vendor saying this ACCOUNT may not use the API at all —
+// `403 {"detail":{"code":"account_restricted","message":"API access is
+// restricted. Please contact support."}}` (measured 2026-11-06). It is a 403,
+// so signedOut() alone reads it as a lapsed sign-in and the card says
+// "登录已过期，请重新登录" — which is wrong twice over: the sign-in is fine
+// (the same token still reads the catalog), and re-signing in cannot fix it.
+// Following that advice is what turns one refusal into a re-login storm, so
+// the two are told apart here and callers answer it as its own state.
+export const restricted = (e) => e?.status === 403 && /restricted/i.test(String(e?.code ?? ""))
 
 // whyOf is the message to show for an error, without the token it might name.
 export const whyOf = (e) => (e instanceof Error ? e.message : String(e ?? ""))
@@ -540,9 +554,38 @@ export async function loginWithPassword(username, password, { timeoutMs = TIMEOU
 export const saidBy = (body) => {
   if (!body || typeof body !== "object") return ""
   const data = body.data && typeof body.data === "object" ? body.data : null
-  for (const said of [body.message, body.msg, body.error, body.detail, data?.message, data?.msg, data?.error, data?.detail]) {
-    if (typeof said === "string" && said.trim()) return said
+  // detail is sometimes a string (FastAPI's `{"detail": "Not Found"}`) and
+  // sometimes an object carrying the vendor's own code and words
+  // (`{"detail":{"code":"account_restricted","message":"API access is
+  // restricted."}}`). Reading only strings threw the object away, and the
+  // refusal reached the card as "HTTP 403" with the reason lost — measured
+  // 2026-11-06 on a restricted account.
+  const words = (v) => {
+    if (typeof v === "string" && v.trim()) return v
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      for (const inner of [v.message, v.msg, v.error, v.detail]) {
+        if (typeof inner === "string" && inner.trim()) return inner
+      }
+    }
+    return ""
   }
+  for (const said of [body.message, body.msg, body.error, body.detail, data?.message, data?.msg, data?.error, data?.detail]) {
+    const said_ = words(said)
+    if (said_) return said_
+  }
+  return ""
+}
+
+// vendorCode is the vendor's own business code for a refusal, when it names
+// one: `{"detail":{"code":"account_restricted"}}` or a top-level `code`
+// string. Kept apart from the HTTP status because the two say different
+// things here — every refusal on this vendor's gateway is a 403, and only
+// the code tells "this account is restricted" from "this sign-in lapsed".
+export const vendorCode = (body) => {
+  if (!body || typeof body !== "object") return ""
+  const d = body.detail
+  if (d && typeof d === "object" && typeof d.code === "string" && d.code.trim()) return d.code.trim()
+  if (typeof body.code === "string" && body.code.trim()) return body.code.trim()
   return ""
 }
 
@@ -615,7 +658,9 @@ export async function request(url, { method = "GET", body, token, timeoutMs = TI
     } catch {
       data = null
     }
-    if (!res.ok) throw new ApiError(saidBy(data) || `HTTP ${res.status}`, res.status)
+    // The vendor's own code rides along so callers can tell a restricted
+    // account from a lapsed sign-in — both arrive as 403 (see restricted).
+    if (!res.ok) throw new ApiError(saidBy(data) || `HTTP ${res.status}`, res.status, vendorCode(data))
     if (data === null) throw new ApiError("接口返回的不是 JSON")
     return data
   } catch (e) {
@@ -1073,4 +1118,4 @@ export const scrubLine = (said, key) => {
 export const scrub = (said, token) => cut(scrubLine(said, String(token ?? "")), 400)
 export const signMessage = (r, token) => scrub(saidBy(r), token)
 
-export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, cadence, sessionOf, modelOf, catalogOf, protocolOf, mergeModel, agentPointsOf, pickOf, balanceOf, unwrapped, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, request, readAnswer, appToken, configPath, shownPath, cleanText, renewToken, loginWithPassword, magicKeys: MAGIC_KEYS, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }
+export const testables = { tokenOf, usernameOf, payloadOf, expiresAt, expired, cadence, sessionOf, modelOf, catalogOf, protocolOf, mergeModel, agentPointsOf, pickOf, balanceOf, unwrapped, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, vendorCode, restricted, signedOut, signedIn, runningActivities, scrubLine, scrub, cut, request, readAnswer, appToken, configPath, shownPath, cleanText, renewToken, loginWithPassword, magicKeys: MAGIC_KEYS, MAX_MODELS, MAX_ANSWER_BYTES, MAX_SCRUB_CHARS, timing: { TIMEOUT_MS, CHECKIN_BUDGET_MS, USAGE_BUDGET_MS, HOST_USAGE_DEADLINE_MS, HOST_CHECKIN_DEADLINE_MS } }

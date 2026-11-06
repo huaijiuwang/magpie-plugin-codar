@@ -12,7 +12,7 @@ import { testables } from "../internal.mjs"
 import * as mod from "../index.mjs"
 import { CATALOG } from "../catalog.mjs"
 
-const { tokenOf, usernameOf, expiresAt, expired, cadence, renewToken, loginWithPassword, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, signedIn, runningActivities, scrubLine, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, MAX_MODELS, MAX_ANSWER_BYTES } = testables
+const { tokenOf, usernameOf, expiresAt, expired, cadence, renewToken, loginWithPassword, modelOf, catalogOf, protocolOf, mergeModel, publishedConcurrency, humanSecs, safeTime, secsOf, checkinWaitSecs, saidBy, vendorCode, restricted, signedIn, runningActivities, scrubLine, scrub, cut, readAnswer, payloadOf, request, appToken, configPath, shownPath, cleanText, pickOf, balanceOf, unwrapped, magicKeys, MAX_MODELS, MAX_ANSWER_BYTES } = testables
 
 // mkToken is a JWT-shaped string with the claims the plugin reads.
 const mkToken = (claims) => {
@@ -3552,6 +3552,37 @@ test("the readings no test used to pin, spelled out one by one", () => {
   assert.equal(saidBy({ detail: "d", message: "m" }), "m", "and message comes before detail")
   assert.equal(saidBy({ message: "   ", msg: "real" }), "real", "a blank string is not words")
   assert.equal(saidBy("nope"), "", "and a body that is not an object says nothing")
+  // FastAPI's shape, which is this vendor's: `detail` is an OBJECT carrying the
+  // code and the sentence. Reading only strings threw both away and the card
+  // said "HTTP 403" with the reason lost (measured 2026-11-06 on a restricted
+  // account). The object's own message is the words; its code is not.
+  assert.equal(
+    saidBy({ detail: { code: "account_restricted", message: "API access is restricted." } }),
+    "API access is restricted.",
+    "a detail object's message is the refusal",
+  )
+  assert.equal(saidBy({ detail: { code: "x" } }), "", "a detail object with no message says nothing")
+  assert.equal(
+    saidBy({ detail: "plain", message: undefined }),
+    "plain",
+    "and a detail that is still a string keeps working",
+  )
+
+  // vendorCode: the vendor's own code, which is what tells a restricted
+  // account from a lapsed sign-in — both arrive as 403 on this gateway.
+  assert.equal(vendorCode({ detail: { code: "account_restricted", message: "no" } }), "account_restricted")
+  assert.equal(vendorCode({ code: "account_restricted" }), "account_restricted", "and a top-level code")
+  assert.equal(vendorCode({ detail: "plain text" }), "", "a string detail names no code")
+  assert.equal(vendorCode({ detail: { code: 42 } }), "", "a number is not a code")
+  assert.equal(vendorCode(null), "", "and no body says nothing")
+
+  // restricted: a 403 the vendor named as account-level, not a lapsed sign-in.
+  // Reading it as signedOut() is what sends a user round a re-login that
+  // cannot work.
+  assert.equal(restricted({ status: 403, code: "account_restricted" }), true)
+  assert.equal(restricted({ status: 401, code: "account_restricted" }), false, "only a 403")
+  assert.equal(restricted({ status: 403, code: "" }), false, "an unnamed 403 stays a lapse")
+  assert.equal(restricted(new Error("boom")), false, "and a plain error is not one")
 
   // secsOf directly: every call site guards the zero, so its own reading of
   // "not stated" was never asked.

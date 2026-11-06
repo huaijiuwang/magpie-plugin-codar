@@ -24,7 +24,7 @@
 
 
 import { CATALOG } from "./catalog.mjs"
-import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, REFRESH_PATH, RENEW_DAY_MS, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, cadence, catalogOf, checkinWaitSecs, cleanText, configPath, cut, expired, expiresAt, gain, humanSecs, loginWithPassword, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, plain, pointsOf, protocolOf, publishedConcurrency, readAnswer, renewToken, request, runningActivities, safeTime, saidBy, scrub, scrubLine, secsOf, sessionOf, shownPath, signMessage, signedIn, signedOut, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./internal.mjs"
+import { ACCOUNT, ACTIVITIES_PATH, ALREADY_CLAIMED, API, CATALOG_PATH, CHECKIN_BUDGET_MS, HOST_CHECKIN_DEADLINE_MS, HOST_USAGE_DEADLINE_MS, ID, MAGIC_KEYS, MAX_ACTIVITY_WINDOWS, MAX_ANSWER_BYTES, MAX_MODELS, MAX_SCRUB_CHARS, OPENAI, REFRESH_PATH, RENEW_DAY_MS, SIGN_PATH, SIGN_STATUS_PATH, TIMEOUT_MS, UA_SIDECAR, USAGE_BUDGET_MS, agentPointsOf, apiBase, appToken, balanceOf, baseURL, cadence, catalogOf, checkinWaitSecs, cleanText, configPath, cut, expired, expiresAt, gain, humanSecs, loginWithPassword, mergeModel, modelOf, modelsOf, noMagicKeys, numOf, payloadOf, pickOf, plain, pointsOf, protocolOf, publishedConcurrency, readAnswer, renewToken, request, runningActivities, safeTime, saidBy, scrub, scrubLine, secsOf, sessionOf, shownPath, signMessage, signedIn, signedOut, restricted, tokenOf, unusableKey, unwrapped, usernameOf, whyOf } from "./internal.mjs"
 
 export async function CodarPlugin(input) {
   // 每次调用现取，而不是建插件时抓一个：测试会在这之后换掉全局那个。宿主
@@ -32,6 +32,12 @@ export async function CodarPlugin(input) {
   // directory/worktree/experimental_workspace/serverUrl/$/magpie——所以读的
   // 就是 globalThis.fetch，没有第二条路。
   const fetchImpl = (...args) => globalThis.fetch(...args)
+
+  // restrictedWords is what a card says when the vendor answered
+  // account_restricted: the sign-in is fine, the account may not use the API,
+  // and re-signing in does not help. Saying "登录已过期，请重新登录" here would
+  // send the user round a loop that cannot end (measured 2026-11-06).
+  const restrictedWords = "这个账号被科搭限制了 API 访问（account_restricted），重新登录也没用，需要联系厂商解除"
 
   // 并发数：厂商目前哪个接口都不说（实测 2026-10-27 的目录、pricing、429
   // 响应里都没有这个数），默认值 3 是量出来的——同时发 4 个，第 4 个收到
@@ -224,6 +230,8 @@ export async function CodarPlugin(input) {
             timeoutMs: Math.min(TIMEOUT_MS, left()),
           })
         } catch (e) {
+          // 账号被厂商限制时重登没用，别把人往重登那条路上带（见 restricted）。
+          if (restricted(e)) return { outcome: "failed", message: restrictedWords }
           if (signedOut(e)) return { outcome: "failed", message: "登录已过期，请重新登录" }
           return { outcome: "failed", message: scrub(whyOf(e), token) || "签到失败" }
         }
@@ -366,6 +374,10 @@ export async function CodarPlugin(input) {
           const e = pointsR.reason
           // 登录过期是整张卡的答案：另两处也会这么说，换谁重试都没用，用户
           // 要做的只有重新登录。这一条是原来那一句，别改成码。
+          // 账号被限制：说实情，但不标 expired——标记会让这一行写成
+          // "sign-in has expired — sign in again"（notePluginLapse 的文案），
+          // 而这句话是错的：登录没过期，重登也没用。不标就是「这次没读到」。
+          if (restricted(e)) return { error: restrictedWords, signIn: "" }
           if (signedOut(e)) return { error: "登录已过期，请重新登录", signIn: "expired" }
           // 通用点数这一处没读到：另一条余额接口若答出了 Agent 数就照画签到
           // 行、活动和 Agent 点数——钱包那一行不画，通用点数这一回没说，编一
