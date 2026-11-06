@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-06
+
+### Fixed
+
+- **账号被厂商限制时，卡片说成"登录已过期，请重新登录"。** 厂商对受限账号回
+  `403 {"detail":{"code":"account_restricted","message":"API access is
+  restricted. Please contact support."}}`。两处都不对：
+  - `saidBy` 只认字符串形式的 `detail`，对象形式（FastAPI 的形状，也是这个厂商
+    的形状）被整段丢掉，理由没到卡片上，只剩一句 `HTTP 403`。
+  - 403 在本插件里一律等于"掉线"，于是同一句拒绝被说成"登录已过期，请重新
+    登录"。这句话错两次：登录没过期（同一 token 打 `/v1/codar/models` 仍是
+    200），重登也解决不了。按它做就是一次拒绝变成一个重登死循环。
+
+  新增 `vendorCode()` 把厂商业务码带进 `ApiError`，`restricted()` 单独认出这一
+  类（403 且 code 含 restricted）。签到与用量两条路都回答真实原因，并且**故意
+  不标 `signIn`**——标了宿主会在账号行写 "sign-in has expired — sign in
+  again"，等于把同样的错误建议换个地方再说一遍。
+- **没有 body 的 GET 也带 `Content-Type: application/json`。** 桌面端自己的
+  fetch 只在有 body 时声明类型，目录 GET 不带。这是插件多加的一个头，已改为
+  有 body 才带。测试里原本有一条断言把这个错行为钉死了（"every request says
+  it is JSON"），已改成「有 body 才声明 JSON」。
+
+### Tests
+
+- 200 → 200（新增 11 条断言：`saidBy` 的对象形态、`vendorCode`、`restricted`
+  的两个易混边界——带码的 401 与不带码的 403；以及 Content-Type 只随 body 走）。
+
 ## [0.2.1] - 2026-11-05
 
 ### Fixed
